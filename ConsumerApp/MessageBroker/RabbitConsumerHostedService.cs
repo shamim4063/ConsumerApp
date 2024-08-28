@@ -1,7 +1,9 @@
-﻿
-using RabbitMQ.Client;
+﻿using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
+using Polly;
+using Polly.RateLimit;
+using Microsoft.Extensions.Hosting;
 
 namespace ConsumerApp.MessageBroker
 {
@@ -11,6 +13,10 @@ namespace ConsumerApp.MessageBroker
         private IModel _channel;
         private string _exchange;
         private string _queueName;
+
+        // Polly Rate Limiting Policy
+        private readonly RateLimitPolicy _rateLimitPolicy;
+
         public RabbitConsumerHostedService()
         {
             var factory = new ConnectionFactory
@@ -30,19 +36,51 @@ namespace ConsumerApp.MessageBroker
             _channel.ExchangeDeclare(exchange: _exchange, type: ExchangeType.Fanout, durable: true);
             _channel.QueueDeclare(queue: _queueName, durable: true, exclusive: false, autoDelete: false);
             _channel.QueueBind(queue: _queueName, exchange: _exchange, routingKey: _queueName);
+
+            // Initialize the rate limiting policy: 5 executions per second
+            _rateLimitPolicy = Policy.RateLimit(5, TimeSpan.FromSeconds(1));
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
             var consumer = new EventingBasicConsumer(_channel);
-            consumer.Received += (model, ea) =>
+            consumer.Received += async (model, ea) =>
             {
-                var body = ea.Body.ToArray();
-                var message = Encoding.UTF8.GetString(body);
-                // Process the message
-                Console.WriteLine($"Received message: {message} Time: {DateTime.Now}");
+                while (true)
+                {
+                    try
+                    {
+                        // Execute the message processing within the rate limit policy
+                        _ = _rateLimitPolicy.Execute(() =>
+                        {
+                            // Since Polly's RateLimitPolicy is synchronous, use Task.Run for async work
+                            return Task.Run(async () =>
+                            {
+                                var body = ea.Body.ToArray();
+                                var message = Encoding.UTF8.GetString(body);
+                                // Process the message
+                                Console.WriteLine($"Received message: {message} Time: {DateTime.Now}");
+
+                                // Simulate processing delay
+                                await Task.Delay(200); // Simulate work
+
+                                // Acknowledge the message
+                                _channel.BasicAck(ea.DeliveryTag, false);
+                            });
+                        });
+
+                        break; // Break out of the loop once the message is successfully processed
+                    }
+                    catch (RateLimitRejectedException)
+                    {
+                        // If the rate limit is hit, wait and retry
+                        Console.WriteLine("Taking rest before next messages");
+                        await Task.Delay(200); // Wait before retrying, adjust the delay as needed
+                    }
+                }
             };
-            _channel.BasicConsume(queue: _queueName, autoAck: true, consumer: consumer);
+
+            _channel.BasicConsume(queue: _queueName, autoAck: false, consumer: consumer);
 
             return Task.CompletedTask;
         }
@@ -53,6 +91,5 @@ namespace ConsumerApp.MessageBroker
             _connection.Close();
             return Task.CompletedTask;
         }
-
     }
 }
