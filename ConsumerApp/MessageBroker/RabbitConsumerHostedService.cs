@@ -1,9 +1,11 @@
 ﻿using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
+using Microsoft.Extensions.Hosting;
+using System.Collections.Concurrent;
 using Polly;
 using Polly.RateLimit;
-using Microsoft.Extensions.Hosting;
+using System.Text.Json;
 
 namespace ConsumerApp.MessageBroker
 {
@@ -13,6 +15,9 @@ namespace ConsumerApp.MessageBroker
         private IModel _channel;
         private string _exchange;
         private string _queueName;
+
+        // In-memory storage to track the last message per key
+        private static readonly ConcurrentDictionary<string, string> LatestMessages = new ConcurrentDictionary<string, string>();
 
         // Polly Rate Limiting Policy
         private readonly RateLimitPolicy _rateLimitPolicy;
@@ -46,37 +51,55 @@ namespace ConsumerApp.MessageBroker
             var consumer = new EventingBasicConsumer(_channel);
             consumer.Received += async (model, ea) =>
             {
-                while (true)
+                var body = ea.Body.ToArray();
+                var message = Encoding.UTF8.GetString(body);
+
+                // Extract the unique identifier from the message (e.g., LeadRefNo)
+                var messageId = ExtractMessageId(message);
+
+                // Store or update the latest message for the given key
+                LatestMessages.AddOrUpdate(messageId, message, (key, oldValue) => message);
+
+                // Delay processing to simulate work and allow other messages to arrive
+                await Task.Delay(200);
+
+                // Now, check if the current message is still the latest one
+                if (LatestMessages.TryGetValue(messageId, out var latestMessage) && latestMessage == message)
                 {
                     try
                     {
                         // Execute the message processing within the rate limit policy
-                        _ = _rateLimitPolicy.Execute(() =>
+                        _rateLimitPolicy.Execute(() =>
                         {
                             // Since Polly's RateLimitPolicy is synchronous, use Task.Run for async work
-                            return Task.Run(async () =>
+                            Task.Run(async () =>
                             {
-                                var body = ea.Body.ToArray();
-                                var message = Encoding.UTF8.GetString(body);
-                                // Process the message
-                                Console.WriteLine($"Received message: {message} Time: {DateTime.Now}");
+                                // Process the latest message
+                                Console.WriteLine($"Processing latest message: {message} for key: {messageId} Time: {DateTime.Now}");
 
                                 // Simulate processing delay
                                 await Task.Delay(200); // Simulate work
 
                                 // Acknowledge the message
                                 _channel.BasicAck(ea.DeliveryTag, false);
-                            });
+                            }).Wait();
                         });
-
-                        break; // Break out of the loop once the message is successfully processed
                     }
                     catch (RateLimitRejectedException)
                     {
-                        // If the rate limit is hit, wait and retry
-                        Console.WriteLine("Taking rest before next messages");
-                        await Task.Delay(200); // Wait before retrying, adjust the delay as needed
+                        Console.WriteLine($"Taking rest because of over message");
+                        // If the rate limit is hit, delay and retry
+                        await Task.Delay(200);
                     }
+
+                    // Remove the processed message from the tracking dictionary
+                    LatestMessages.TryRemove(messageId, out _);
+                }
+                else
+                {
+                    // The current message is outdated, acknowledge and discard
+                    Console.WriteLine($"Discarding outdated message: {message} for key: {messageId}");
+                    _channel.BasicAck(ea.DeliveryTag, false);
                 }
             };
 
@@ -91,5 +114,20 @@ namespace ConsumerApp.MessageBroker
             _connection.Close();
             return Task.CompletedTask;
         }
+
+        private string ExtractMessageId(string message)
+        {
+            var messageData = JsonSerializer.Deserialize<MessageDto>(message);
+            if (messageData == null)
+                throw new Exception("Invalid Message");
+            return messageData.Feature + "-" + messageData.LeadGuId;
+        }
+    }
+
+    public class MessageDto
+    {
+        public string LeadGuId { get; set; }
+        public string Feature { get; set; }
+        public Dictionary<string, string> PropertyKeyValues { get;set;}
     }
 }
